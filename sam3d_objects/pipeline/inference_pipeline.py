@@ -695,6 +695,9 @@ class InferencePipeline:
                 wrapped_callback = None
                 if callback_on_step_end is not None:
                     ss_decoder = self.models["ss_decoder"]
+                    # Get rgb_image for color sampling (shape: 1, 3, H, W)
+                    rgb_image_for_sampling = ss_input_dict.get("rgb_image", None)
+                    
                     def wrapped_callback(step, total_steps, timestep, latent):
                         # Decode the latent to get voxel grid
                         if isinstance(latent, dict):
@@ -715,11 +718,36 @@ class InferencePipeline:
                         threshold = -0.5 + progress * 0.8
                         coords = torch.argwhere(ss > threshold)[:, [0, 2, 3, 4]].int()
                         
+                        # Sample colors from input image using simple projection
+                        colors = None
+                        if rgb_image_for_sampling is not None and len(coords) > 0:
+                            try:
+                                # rgb_image shape: (1, 3, H, W)
+                                _, _, H, W = rgb_image_for_sampling.shape
+                                
+                                # Normalize voxel coords to [0, 1] (coords are in 0-63 range)
+                                # Use X and Z for image projection (front view)
+                                voxel_coords = coords[:, 1:].float()  # Remove batch dim, shape (N, 3)
+                                
+                                # Project voxels to image space using X (width) and Y (height)
+                                # Voxels are 0-63, normalize and flip Y for image coords
+                                u = (voxel_coords[:, 0] / 63.0 * (W - 1)).long().clamp(0, W - 1)
+                                v = ((1.0 - voxel_coords[:, 1] / 63.0) * (H - 1)).long().clamp(0, H - 1)
+                                
+                                # Sample colors from image
+                                img = rgb_image_for_sampling[0]  # (3, H, W)
+                                sampled_colors = img[:, v, u].T  # (N, 3)
+                                colors = (sampled_colors.clamp(0, 1) * 255).to(torch.uint8)
+                            except Exception as e:
+                                logger.warning(f"Failed to sample geometry colors at step {step}: {e}")
+                                colors = None
+                        
                         callback_on_step_end(
                             stage="geometry",
                             step=step,
                             total_steps=total_steps,
                             coords=coords,
+                            colors=colors,
                             latent=shape_latent,
                         )
                 
@@ -798,18 +826,39 @@ class InferencePipeline:
                 )
                 condition_args += (coords.cpu().numpy(),)
                 
-                # Wrap callback to extract colors from SLAT features
+                # Wrap callback to decode SLAT features and extract accurate colors
                 wrapped_callback = None
                 if callback_on_step_end is not None:
+                    slat_decoder_gs = self.models["slat_decoder_gs"]
+                    slat_std = self.slat_std
+                    slat_mean = self.slat_mean
+                    
                     def wrapped_callback(step, total_steps, timestep, latent):
-                        # SLAT features - first 3 channels encode color-like info
-                        # Normalize and clamp to get approximate colors
                         colors = None
                         if isinstance(latent, torch.Tensor) and latent.dim() >= 2:
-                            # latent shape: (batch, num_voxels, 8)
-                            color_features = latent[:, :, :3]
-                            colors = (color_features * 0.3 + 0.5).clamp(0, 1) * 255
-                            colors = colors[0].to(torch.uint8)  # (num_voxels, 3)
+                            try:
+                                # Apply SLAT normalization (same as post-generation)
+                                normalized_latent = latent * slat_std.to(latent.device) + slat_mean.to(latent.device)
+                                
+                                # Create SparseTensor and run decoder
+                                slat_tensor = sp.SparseTensor(
+                                    coords=coords,
+                                    feats=normalized_latent[0],
+                                ).to(latent.device)
+                                
+                                # Decode to get Gaussians with actual colors
+                                gaussians = slat_decoder_gs(slat_tensor)
+                                if gaussians and len(gaussians) > 0:
+                                    # _features_dc has shape (num_points, 1, 3) - contains SH DC color
+                                    features_dc = gaussians[0]._features_dc  # (N, 1, 3)
+                                    # Convert SH DC coefficients to RGB
+                                    # SH0 coefficient: color = SH_DC * C0 + 0.5, where C0 ≈ 0.28209
+                                    C0 = 0.28209479177387814
+                                    rgb = features_dc.squeeze(1) * C0 + 0.5  # (N, 3)
+                                    colors = (rgb.clamp(0, 1) * 255).to(torch.uint8)
+                            except Exception as e:
+                                logger.warning(f"Failed to decode SLAT colors at step {step}: {e}")
+                                colors = None
                         
                         callback_on_step_end(
                             stage="appearance",

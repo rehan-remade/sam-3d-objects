@@ -350,11 +350,72 @@ class InferencePipelinePointMap(InferencePipeline):
             slat_input_dict = self.preprocess_image(image, self.slat_preprocessor)
             if seed is not None:
                 torch.manual_seed(seed)
+            
+            # Wrap geometry callback to use pointmap-based color sampling
+            wrapped_geometry_callback = geometry_callback
+            if geometry_callback is not None:
+                # Get pointmap and colors for accurate 3D→2D projection
+                pointmap_for_sampling = ss_input_dict.get("pointmap", None)  # (1, 3, H, W)
+                rgb_image_for_sampling = ss_input_dict.get("rgb_image", None)  # (1, 3, H, W)
+                pointmap_scale = ss_input_dict.get("pointmap_scale", None)
+                pointmap_shift = ss_input_dict.get("pointmap_shift", None)
+                
+                def wrapped_geometry_callback(stage, step, total_steps, coords, colors=None, latent=None, **kwargs):
+                    # If we have pointmap, use it for more accurate color sampling
+                    if pointmap_for_sampling is not None and rgb_image_for_sampling is not None and len(coords) > 0:
+                        try:
+                            # pointmap shape: (1, 3, H, W), rgb_image: (1, 3, H, W)
+                            pm = pointmap_for_sampling[0]  # (3, H, W)
+                            rgb = rgb_image_for_sampling[0]  # (3, H, W)
+                            _, H, W = pm.shape
+                            
+                            # Normalize voxel coords to [-0.5, 0.5] (matching pointmap space)
+                            voxel_coords = coords[:, 1:].float()  # (N, 3), remove batch dim
+                            voxel_normalized = voxel_coords / 63.0 - 0.5  # Now in [-0.5, 0.5]
+                            
+                            # Reshape pointmap for distance calculation: (H*W, 3)
+                            pm_flat = pm.permute(1, 2, 0).reshape(-1, 3)  # (H*W, 3)
+                            
+                            # Find nearest pointmap pixel for each voxel using batch processing
+                            # To avoid OOM, process in chunks if needed
+                            chunk_size = min(1000, len(voxel_normalized))
+                            nearest_indices = []
+                            
+                            for i in range(0, len(voxel_normalized), chunk_size):
+                                chunk = voxel_normalized[i:i+chunk_size]  # (chunk, 3)
+                                # Compute distances: (chunk, H*W)
+                                dists = torch.cdist(chunk.unsqueeze(0), pm_flat.unsqueeze(0)).squeeze(0)
+                                nearest_idx = dists.argmin(dim=1)  # (chunk,)
+                                nearest_indices.append(nearest_idx)
+                            
+                            nearest_indices = torch.cat(nearest_indices)  # (N,)
+                            
+                            # Convert flat indices to 2D coords
+                            v_coords = nearest_indices // W
+                            u_coords = nearest_indices % W
+                            
+                            # Sample colors from image
+                            sampled_colors = rgb[:, v_coords, u_coords].T  # (N, 3)
+                            colors = (sampled_colors.clamp(0, 1) * 255).to(torch.uint8)
+                        except Exception as e:
+                            logger.warning(f"Failed to sample pointmap colors at step {step}: {e}")
+                            # Fall back to the colors from parent class
+                    
+                    geometry_callback(
+                        stage=stage,
+                        step=step,
+                        total_steps=total_steps,
+                        coords=coords,
+                        colors=colors,
+                        latent=latent,
+                        **kwargs,
+                    )
+            
             ss_return_dict = self.sample_sparse_structure(
                 ss_input_dict,
                 inference_steps=stage1_inference_steps,
                 use_distillation=use_stage1_distillation,
-                callback_on_step_end=geometry_callback,
+                callback_on_step_end=wrapped_geometry_callback,
             )
 
             # We could probably use the decoder from the models themselves
