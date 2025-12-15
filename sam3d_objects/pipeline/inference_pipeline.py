@@ -480,6 +480,8 @@ class InferencePipeline:
         use_stage1_distillation=False,
         use_stage2_distillation=False,
         decode_formats=None,
+        geometry_callback=None,
+        appearance_callback=None,
     ) -> dict:
         """
         Parameters:
@@ -501,6 +503,7 @@ class InferencePipeline:
                 ss_input_dict,
                 inference_steps=stage1_inference_steps,
                 use_distillation=use_stage1_distillation,
+                callback_on_step_end=geometry_callback,
             )
 
             ss_return_dict.update(self.pose_decoder(ss_return_dict))
@@ -519,6 +522,7 @@ class InferencePipeline:
                 coords,
                 inference_steps=stage2_inference_steps,
                 use_distillation=use_stage2_distillation,
+                callback_on_step_end=appearance_callback,
             )
             outputs = self.decode_slat(
                 slat, self.decode_formats if decode_formats is None else decode_formats
@@ -642,7 +646,8 @@ class InferencePipeline:
         return condition_args, condition_kwargs
 
     def sample_sparse_structure(
-        self, ss_input_dict: dict, inference_steps=None, use_distillation=False
+        self, ss_input_dict: dict, inference_steps=None, use_distillation=False,
+        callback_on_step_end=None,
     ):
         ss_generator = self.models["ss_generator"]
         ss_decoder = self.models["ss_decoder"]
@@ -685,10 +690,44 @@ class InferencePipeline:
                     ss_input_dict,
                     self.ss_condition_input_mapping,
                 )
+                
+                # Wrap callback to decode latent at each step for streaming
+                wrapped_callback = None
+                if callback_on_step_end is not None:
+                    ss_decoder = self.models["ss_decoder"]
+                    def wrapped_callback(step, total_steps, timestep, latent):
+                        # Decode the latent to get voxel grid
+                        if isinstance(latent, dict):
+                            shape_latent = latent.get("shape", list(latent.values())[0])
+                        else:
+                            shape_latent = latent
+                        
+                        # Decode to sparse structure
+                        with torch.no_grad():
+                            ss = ss_decoder(
+                                shape_latent.permute(0, 2, 1)
+                                .contiguous()
+                                .view(shape_latent.shape[0], 8, 16, 16, 16)
+                            )
+                        
+                        # Progressive threshold for "crystallizing" effect
+                        progress = step / max(total_steps - 1, 1) if total_steps else 0.5
+                        threshold = -0.5 + progress * 0.8
+                        coords = torch.argwhere(ss > threshold)[:, [0, 2, 3, 4]].int()
+                        
+                        callback_on_step_end(
+                            stage="geometry",
+                            step=step,
+                            total_steps=total_steps,
+                            coords=coords,
+                            latent=shape_latent,
+                        )
+                
                 return_dict = ss_generator(
                     latent_shape_dict,
                     image.device,
                     *condition_args,
+                    callback_on_step_end=wrapped_callback,
                     **condition_kwargs,
                 )
                 if not self.is_mm_dit():
@@ -726,6 +765,7 @@ class InferencePipeline:
         coords: torch.Tensor,
         inference_steps=25,
         use_distillation=False,
+        callback_on_step_end=None,
     ) -> sp.SparseTensor:
         image = slat_input["image"]
         DEVICE = image.device
@@ -757,8 +797,33 @@ class InferencePipeline:
                     self.slat_condition_input_mapping,
                 )
                 condition_args += (coords.cpu().numpy(),)
+                
+                # Wrap callback to extract colors from SLAT features
+                wrapped_callback = None
+                if callback_on_step_end is not None:
+                    def wrapped_callback(step, total_steps, timestep, latent):
+                        # SLAT features - first 3 channels encode color-like info
+                        # Normalize and clamp to get approximate colors
+                        colors = None
+                        if isinstance(latent, torch.Tensor) and latent.dim() >= 2:
+                            # latent shape: (batch, num_voxels, 8)
+                            color_features = latent[:, :, :3]
+                            colors = (color_features * 0.3 + 0.5).clamp(0, 1) * 255
+                            colors = colors[0].to(torch.uint8)  # (num_voxels, 3)
+                        
+                        callback_on_step_end(
+                            stage="appearance",
+                            step=step,
+                            total_steps=total_steps,
+                            coords=coords,
+                            colors=colors,
+                            latent=latent,
+                        )
+                
                 slat = slat_generator(
-                    latent_shape, DEVICE, *condition_args, **condition_kwargs
+                    latent_shape, DEVICE, *condition_args,
+                    callback_on_step_end=wrapped_callback,
+                    **condition_kwargs,
                 )
                 slat = sp.SparseTensor(
                     coords=coords,

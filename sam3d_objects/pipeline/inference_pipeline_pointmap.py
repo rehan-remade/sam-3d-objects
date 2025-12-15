@@ -330,6 +330,8 @@ class InferencePipelinePointMap(InferencePipeline):
         pointmap=None,
         decode_formats=None,
         estimate_plane=False,
+        geometry_callback=None,
+        appearance_callback=None,
     ) -> dict:
         image = self.merge_image_and_mask(image, mask)
         with self.device: 
@@ -352,6 +354,7 @@ class InferencePipelinePointMap(InferencePipeline):
                 ss_input_dict,
                 inference_steps=stage1_inference_steps,
                 use_distillation=use_stage1_distillation,
+                callback_on_step_end=geometry_callback,
             )
 
             # We could probably use the decoder from the models themselves
@@ -384,6 +387,7 @@ class InferencePipelinePointMap(InferencePipeline):
                 coords,
                 inference_steps=stage2_inference_steps,
                 use_distillation=use_stage2_distillation,
+                callback_on_step_end=appearance_callback,
             )
             outputs = self.decode_slat(
                 slat, self.decode_formats if decode_formats is None else decode_formats

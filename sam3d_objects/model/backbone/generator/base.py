@@ -34,22 +34,31 @@ class Base(torch.nn.Module):
     def random_generator(self, generator: torch.Generator):
         self._random_generator = generator
 
-    def forward(self, x_shape, x_device, *args_conditionals, **kwargs_conditionals):
+    def forward(self, x_shape, x_device, *args_conditionals, callback_on_step_end=None, **kwargs_conditionals):
         return self.generate(
             x_shape,
             x_device,
             *args_conditionals,
+            callback_on_step_end=callback_on_step_end,
             **kwargs_conditionals,
         )
 
-    def generate(self, x_shape, x_device, *args_conditionals, **kwargs_conditionals):
-        for _, xt, _ in self.generate_iter(
+    def generate(self, x_shape, x_device, *args_conditionals, callback_on_step_end=None, **kwargs_conditionals):
+        total_steps = getattr(self, 'inference_steps', None)
+        for step_idx, (t, xt, _) in enumerate(self.generate_iter(
             x_shape,
             x_device,
             *args_conditionals,
             **kwargs_conditionals,
-        ):
-            pass
+        )):
+            # Call the callback if provided
+            if callback_on_step_end is not None:
+                callback_on_step_end(
+                    step=step_idx,
+                    total_steps=total_steps,
+                    timestep=t,
+                    latent=xt,
+                )
         return xt
 
     def generate_iter(
