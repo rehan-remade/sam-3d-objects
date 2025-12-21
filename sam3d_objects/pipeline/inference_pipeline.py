@@ -482,6 +482,7 @@ class InferencePipeline:
         decode_formats=None,
         geometry_callback=None,
         appearance_callback=None,
+        decode_callback=None,
     ) -> dict:
         """
         Parameters:
@@ -527,8 +528,23 @@ class InferencePipeline:
             outputs = self.decode_slat(
                 slat, self.decode_formats if decode_formats is None else decode_formats
             )
+            
+            # Stream raw mesh with vertex colors (fast preview before texture baking)
+            if decode_callback is not None and "mesh" in outputs:
+                try:
+                    raw_mesh = outputs["mesh"][0]
+                    decode_callback(
+                        stage="mesh_preview",
+                        vertices=raw_mesh.vertices.float().cpu().numpy(),
+                        faces=raw_mesh.faces.cpu().numpy(),
+                        vertex_colors=raw_mesh.vertex_attrs[:, :3].cpu().numpy(),
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to stream mesh preview: {e}")
+            
             outputs = self.postprocess_slat_output(
-                outputs, with_mesh_postprocess, with_texture_baking, use_vertex_color
+                outputs, with_mesh_postprocess, with_texture_baking, use_vertex_color,
+                decode_callback=decode_callback,
             )
             logger.info("Finished!")
 
@@ -538,12 +554,23 @@ class InferencePipeline:
             }
 
     def postprocess_slat_output(
-        self, outputs, with_mesh_postprocess, with_texture_baking, use_vertex_color
+        self, outputs, with_mesh_postprocess, with_texture_baking, use_vertex_color,
+        decode_callback=None,
     ):
         # GLB files can be extracted from the outputs
         logger.info(
             f"Postprocessing mesh with option with_mesh_postprocess {with_mesh_postprocess}, with_texture_baking {with_texture_baking}..."
         )
+        
+        # Notify client that postprocessing is starting
+        if decode_callback is not None:
+            decode_callback(
+                stage="postprocessing",
+                status="started",
+                with_mesh_postprocess=with_mesh_postprocess,
+                with_texture_baking=with_texture_baking,
+            )
+        
         if "mesh" in outputs:
             glb = postprocessing_utils.to_glb(
                 outputs["gaussian"][0],
@@ -557,6 +584,19 @@ class InferencePipeline:
                 use_vertex_color=use_vertex_color,
                 rendering_engine=self.rendering_engine,
             )
+            
+            # Stream final GLB
+            if decode_callback is not None:
+                import io
+                glb_bytes = None
+                if glb is not None:
+                    buffer = io.BytesIO()
+                    glb.export(buffer, file_type="glb")
+                    glb_bytes = buffer.getvalue()
+                decode_callback(
+                    stage="glb_ready",
+                    glb_bytes=glb_bytes,
+                )
 
         # glb.export("sample.glb")
         else:
@@ -829,9 +869,12 @@ class InferencePipeline:
                 # Wrap callback to decode SLAT features and extract accurate colors
                 wrapped_callback = None
                 if callback_on_step_end is not None:
+                    from sam3d_objects.model.backbone.tdfy_dit.renderers.sh_utils import SH2RGB
+                    
                     slat_decoder_gs = self.models["slat_decoder_gs"]
                     slat_std = self.slat_std
                     slat_mean = self.slat_mean
+                    num_voxels = coords.shape[0]
                     
                     def wrapped_callback(step, total_steps, timestep, latent):
                         colors = None
@@ -846,15 +889,23 @@ class InferencePipeline:
                                     feats=normalized_latent[0],
                                 ).to(latent.device)
                                 
-                                # Decode to get Gaussians with actual colors
+                                # Decode to get Gaussians
                                 gaussians = slat_decoder_gs(slat_tensor)
                                 if gaussians and len(gaussians) > 0:
-                                    # _features_dc has shape (num_points, 1, 3) - contains SH DC color
-                                    features_dc = gaussians[0]._features_dc  # (N, 1, 3)
-                                    # Convert SH DC coefficients to RGB
-                                    # SH0 coefficient: color = SH_DC * C0 + 0.5, where C0 ≈ 0.28209
-                                    C0 = 0.28209479177387814
-                                    rgb = features_dc.squeeze(1) * C0 + 0.5  # (N, 3)
+                                    gs = gaussians[0]
+                                    
+                                    # Use existing get_features (returns SH coefficients)
+                                    # Shape: (N * num_gaussians, 1, 3) for sh_degree=0
+                                    sh_features = gs.get_features  # SH DC coefficients
+                                    
+                                    # Convert SH to RGB using existing utility
+                                    rgb = SH2RGB(sh_features.squeeze(1))  # (N * G, 3)
+                                    
+                                    # Average colors per voxel (if multiple gaussians per voxel)
+                                    num_gaussians = slat_decoder_gs.rep_config.get("num_gaussians", 1)
+                                    if num_gaussians > 1:
+                                        rgb = rgb.reshape(num_voxels, num_gaussians, 3).mean(dim=1)
+                                    
                                     colors = (rgb.clamp(0, 1) * 255).to(torch.uint8)
                             except Exception as e:
                                 logger.warning(f"Failed to decode SLAT colors at step {step}: {e}")
