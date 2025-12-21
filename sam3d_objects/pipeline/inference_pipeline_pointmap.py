@@ -332,6 +332,7 @@ class InferencePipelinePointMap(InferencePipeline):
         estimate_plane=False,
         geometry_callback=None,
         appearance_callback=None,
+        decode_callback=None,
     ) -> dict:
         image = self.merge_image_and_mask(image, mask)
         with self.device: 
@@ -453,8 +454,23 @@ class InferencePipelinePointMap(InferencePipeline):
             outputs = self.decode_slat(
                 slat, self.decode_formats if decode_formats is None else decode_formats
             )
+            
+            # Stream raw mesh with vertex colors (fast preview before texture baking)
+            if decode_callback is not None and "mesh" in outputs:
+                try:
+                    raw_mesh = outputs["mesh"][0]
+                    decode_callback(
+                        stage="mesh_preview",
+                        vertices=raw_mesh.vertices.float().cpu().numpy(),
+                        faces=raw_mesh.faces.cpu().numpy(),
+                        vertex_colors=raw_mesh.vertex_attrs[:, :3].cpu().numpy(),
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to stream mesh preview: {e}")
+            
             outputs = self.postprocess_slat_output(
-                outputs, with_mesh_postprocess, with_texture_baking, use_vertex_color
+                outputs, with_mesh_postprocess, with_texture_baking, use_vertex_color,
+                decode_callback=decode_callback,
             )
             glb = outputs.get("glb", None)
 
