@@ -735,8 +735,6 @@ class InferencePipeline:
                 wrapped_callback = None
                 if callback_on_step_end is not None:
                     ss_decoder = self.models["ss_decoder"]
-                    # Get rgb_image for color sampling (shape: 1, 3, H, W)
-                    rgb_image_for_sampling = ss_input_dict.get("rgb_image", None)
                     
                     def wrapped_callback(step, total_steps, timestep, latent):
                         # Decode the latent to get voxel grid
@@ -758,36 +756,13 @@ class InferencePipeline:
                         threshold = -0.5 + progress * 0.8
                         coords = torch.argwhere(ss > threshold)[:, [0, 2, 3, 4]].int()
                         
-                        # Sample colors from input image using simple projection
-                        colors = None
-                        if rgb_image_for_sampling is not None and len(coords) > 0:
-                            try:
-                                # rgb_image shape: (1, 3, H, W)
-                                _, _, H, W = rgb_image_for_sampling.shape
-                                
-                                # Normalize voxel coords to [0, 1] (coords are in 0-63 range)
-                                # Use X and Z for image projection (front view)
-                                voxel_coords = coords[:, 1:].float()  # Remove batch dim, shape (N, 3)
-                                
-                                # Project voxels to image space using X (width) and Y (height)
-                                # Voxels are 0-63, normalize and flip Y for image coords
-                                u = (voxel_coords[:, 0] / 63.0 * (W - 1)).long().clamp(0, W - 1)
-                                v = ((1.0 - voxel_coords[:, 1] / 63.0) * (H - 1)).long().clamp(0, H - 1)
-                                
-                                # Sample colors from image
-                                img = rgb_image_for_sampling[0]  # (3, H, W)
-                                sampled_colors = img[:, v, u].T  # (N, 3)
-                                colors = (sampled_colors.clamp(0, 1) * 255).to(torch.uint8)
-                            except Exception as e:
-                                logger.warning(f"Failed to sample geometry colors at step {step}: {e}")
-                                colors = None
-                        
+                        # No color estimation in geometry stage - colors come from appearance stage
                         callback_on_step_end(
                             stage="geometry",
                             step=step,
                             total_steps=total_steps,
                             coords=coords,
-                            colors=colors,
+                            colors=None,
                             latent=shape_latent,
                         )
                 
